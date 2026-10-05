@@ -1,4 +1,5 @@
 import type { RowMeta } from './persistence';
+import { SYNC_TOLERANCE_MM } from '../utils/tolerance';
 
 /** 同步要求 */
 export type SyncRequirement = 'sync' | 'cross' | 'single';
@@ -56,17 +57,25 @@ export interface StepDraft {
   leader: string;
 }
 
-/** 顶升步骤视图：含累计量与校验结论 */
+/** 顶升步骤视图：含累计量、批次偏差与校验结论 */
 export interface StepView extends Step {
   bridgeName: string;
   /** 本步及之前步骤的累计目标顶升量（mm） */
   cumulativeLiftMm: number;
   /** 累计顶升量与限位值的关系 */
   overLimit: boolean;
-  /** 该步骤的测点读数条数 */
+  /** 该步骤的测点读数条数（含被更正的历史读数） */
   readingCount: number;
-  /** 同步偏差（mm），无读数为 null */
+  /** 该步骤的录入批次数（按提交批次归组） */
+  batchCount: number;
+  /** 参与同步偏差评定的批次数（剔除单点批） */
+  ratedBatchCount: number;
+  /** 同步偏差（mm）：取各批极差中最差的一批；无多点批为 null */
   syncDeviationMm: number | null;
+  /** 最差批次在步骤内的序号（从 1 开始）；无多点批为 null */
+  worstBatchSeq: number | null;
+  /** 最差批次标签，如 第2批（09:15）；无多点批为 null */
+  worstBatchLabel: string | null;
   /** 校验结论文案 */
   validation: string;
 }
@@ -108,4 +117,32 @@ export function syncLayoutHint(requirement: SyncRequirement): string {
   if (requirement === 'sync') return '同步顶升：四角同步，各测点偏差宜控制在 1.5mm 内';
   if (requirement === 'cross') return '交叉顶升：对角交替加力，注意换向时位移回弹';
   return '单点顶升：仅单点受力，须限制单级顶升量并实时观察相邻支座';
+}
+
+/**
+ * 步骤放行判定：从“顶升中”推进到“已到位”时，先看最差批次的同步偏差。
+ * 按批比较，超过 1.5mm 不放行，并写明哪批差了多少；
+ * 单点批不参与评定，没有多点批时放行（不卡步骤）。
+ */
+export interface StepArrivalGate {
+  /** 是否放行 */
+  allowed: boolean;
+  /** 阻断或提示文案 */
+  message: string;
+}
+
+export function stepArrivalGate(
+  worstDeviationMm: number | null,
+  worstBatchLabel: string | null,
+): StepArrivalGate {
+  if (worstDeviationMm === null || worstBatchLabel === null) {
+    return { allowed: true, message: '该步骤没有多点批次读数，同步偏差不参与放行评定' };
+  }
+  if (worstDeviationMm > SYNC_TOLERANCE_MM) {
+    return {
+      allowed: false,
+      message: `${worstBatchLabel}同步偏差 ${worstDeviationMm.toFixed(2)} mm，超过 ${SYNC_TOLERANCE_MM} mm 允许值，调平并补录合格批次后方可标记已到位`,
+    };
+  }
+  return { allowed: true, message: `${worstBatchLabel}同步偏差 ${worstDeviationMm.toFixed(2)} mm，满足放行要求` };
 }

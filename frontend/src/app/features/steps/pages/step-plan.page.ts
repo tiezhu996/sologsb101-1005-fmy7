@@ -22,6 +22,7 @@ import {
   SYNC_REQUIREMENT_LABEL,
   cumulativeHint,
   liftStepHint,
+  stepArrivalGate,
   syncLayoutHint,
   type StepDraft,
   type StepState,
@@ -195,7 +196,7 @@ export class StepDialogComponent {
         [value]="stats().readingCount"
         [suffix]="'条'"
         color="#3949ab"
-        hint="同步偏差按步骤内读数极差计算"
+        hint="同步偏差按每批极差取最差批，单点批不评定"
       />
     </div>
 
@@ -266,11 +267,13 @@ export class StepDialogComponent {
                   </mat-chip-set>
                 </td>
                 <td>
-                  {{ step.readingCount }} 条
-                  @if (step.syncDeviationMm !== null) {
-                    <span [style.color]="levelColor(step)">
-                      / 偏差 {{ formatMm(step.syncDeviationMm) }}（{{ levelLabel(step) }}）
-                    </span>
+                  {{ step.readingCount }} 条 / {{ step.batchCount }} 批
+                  @if (step.syncDeviationMm !== null && step.worstBatchLabel) {
+                    <div [style.color]="levelColor(step)" class="gb-hint" style="font-size: 12px">
+                      {{ step.worstBatchLabel }}最差：{{ formatMm(step.syncDeviationMm) }}（{{ levelLabel(step) }}）
+                    </div>
+                  } @else if (step.readingCount > 0) {
+                    <div class="gb-hint" style="font-size: 12px">仅单点批，不评偏差</div>
                   }
                 </td>
                 <td class="gb-hint">{{ step.validation }}</td>
@@ -283,7 +286,12 @@ export class StepDialogComponent {
                       <mat-icon>arrow_downward</mat-icon>
                     </button>
                     @for (next of nextStates(step.state); track next) {
-                      <button mat-button color="primary" (click)="advance(step, next)">
+                      <button
+                        mat-button
+                        color="primary"
+                        [matTooltip]="advanceHint(step, next)"
+                        (click)="advance(step, next)"
+                      >
                         <mat-icon>play_arrow</mat-icon>
                         {{ stepStateLabel[next] }}
                       </button>
@@ -526,9 +534,23 @@ export class StepPlanPage {
     this.notify(`步骤 #${step.seq} 已${direction === -1 ? '上移' : '下移'}`);
   }
 
+  /** 推进状态；顶升中 → 已到位 先看最差批次，超过 1.5mm 不放行并写明哪批差了多少 */
   advance(step: StepView, next: StepState): void {
+    if (next === 'arrived') {
+      const gate = stepArrivalGate(step.syncDeviationMm, step.worstBatchLabel);
+      if (!gate.allowed) {
+        this.snackBar.open(gate.message, '关闭', { duration: 4200 });
+        return;
+      }
+    }
     this.store.dispatch(stepActions.advanceState({ id: step.id, next }));
     this.notify(`步骤 #${step.seq} 已推进为${STEP_STATE_LABEL[next]}`);
+  }
+
+  /** 推进按钮悬浮提示：放行 / 阻断原因 */
+  advanceHint(step: StepView, next: StepState): string {
+    if (next !== 'arrived') return `推进为${STEP_STATE_LABEL[next]}`;
+    return stepArrivalGate(step.syncDeviationMm, step.worstBatchLabel).message;
   }
 
   openDialog(step: StepView | null): void {

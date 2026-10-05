@@ -18,7 +18,7 @@ import { ROW_REVISION, type Revisioned } from '../types/persistence';
 export const DB_NAME = 'gbbridgebear';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 export { ROW_REVISION };
 export type { Revisioned };
@@ -54,7 +54,7 @@ class BridgeBearingDatabase extends Dexie {
 
     // v2：新增 revision 行修订号；支座补充组合索引便于按墩台批量评级，
     //     顶升步骤补充同步要求索引，验收补充组合索引，并新增 settings 表
-    this.version(DB_SCHEMA_VERSION)
+    this.version(2)
       .stores({
         bridges: 'id, name, bridgeType, builtYear, roadClass, archived',
         piers: 'id, bridgeId, code, capElevation, [bridgeId+code]',
@@ -100,6 +100,18 @@ class BridgeBearingDatabase extends Dexie {
           if (typeof row.targetLiftMm !== 'number' && typeof row.lift === 'number') row.targetLiftMm = row.lift;
         });
       });
+
+    // v3：测点读数补充 batchId 批次索引。顶升班组逐批录入位移，同步偏差改为按批极差评定；
+    //     早期读数没有 batchId，运行时按“步骤 + 记录时间”归批，无需搬数据。
+    this.version(DB_SCHEMA_VERSION).stores({
+      bridges: 'id, name, bridgeType, builtYear, roadClass, archived',
+      piers: 'id, bridgeId, code, capElevation, [bridgeId+code]',
+      bearings: 'id, pierId, diseaseGrade, type, serial, [pierId+serial]',
+      steps: 'id, bridgeId, seq, state, syncRequirement, [bridgeId+seq]',
+      readings: 'id, stepId, pointCode, recordedAt, batchId, [stepId+pointCode], [stepId+batchId]',
+      acceptances: 'id, bearingId, stage, conclusion, [bearingId+stage]',
+      settings: 'id',
+    });
   }
 }
 
@@ -314,6 +326,9 @@ async function seedDatabase(): Promise<void> {
       const pointCount = stepSpec.sync === 'single' ? 1 : 4;
       const rounds = stepSpec.state === 'arrived' ? 3 : 2;
       for (let round = 0; round < rounds; round += 1) {
+        // 同一批读数共用记录时间与批次号：顶升班组逐批录入，偏差按批内极差评定
+        const roundRecordedAt = dateTimeText(0, 9 + round, 5);
+        const batchId = `batch-${stepId}-${round + 1}`;
         for (let point = 0; point < pointCount; point += 1) {
           const base = stepSpec.targetLiftMm * ((round + 1) / (rounds + 1));
           const jitter = (random() - 0.5) * 1.4;
@@ -323,8 +338,9 @@ async function seedDatabase(): Promise<void> {
             pointCode: `P${point + 1}`,
             displacementMm: Number((base + jitter).toFixed(2)),
             stressMpa: Number((7 + random() * 6).toFixed(2)),
-            recordedAt: dateTimeText(0, 9 + round, 5 + point * 5),
+            recordedAt: roundRecordedAt,
             operator: operators[(stepIndex + round) % operators.length],
+            batchId,
             createdAt: stamp,
             revision: ROW_REVISION,
           });
@@ -465,6 +481,77 @@ export async function putReading(row: ReadingRow): Promise<void> {
 
 export async function putReadings(rows: ReadingRow[]): Promise<void> {
   await db.readings.bulkPut(rows);
+}
+
+/** 按批提交读数的入参（一批共用 stepId / recordedAt / operator / batchId） */
+export interface ReadingBatchSubmission {
+  stepId: string;
+  recordedAt: string;
+  operator: string;
+  rows: Array<{ pointCode: string; displacementMm: number; stressMpa: number }>;
+}
+
+/** 按批提交的结果 */
+export interface ReadingBatchResult {
+  batchId: string;
+  inserted: number;
+  updated: number;
+}
+
+/**
+ * 提交一批测点读数。
+ * - 同一步骤、同一记录时间视为同一批：沿用该批已有的 batchId，没有则新建；
+ * - 同一测点在该批里再次提交即更正（同 id 覆盖），以最后提交的一条为准；
+ * - 新测点新增读数。早期无 batchId 的读数命中同步骤 + 同记录时间时，
+ *   一并回填 batchId，使更正与旧读数归在同一批。
+ */
+export async function submitReadingBatch(submission: ReadingBatchSubmission): Promise<ReadingBatchResult> {
+  const { stepId, recordedAt, operator, rows } = submission;
+  const stamp = new Date().toISOString();
+  return db.transaction('rw', db.readings, async () => {
+    const sameStep = await db.readings.where('stepId').equals(stepId).toArray();
+    const sameTime = sameStep.filter((item) => item.recordedAt === recordedAt);
+    const existingBatch = sameTime.find((item) => typeof item.batchId === 'string' && item.batchId.length > 0);
+    const batchId = existingBatch?.batchId ?? newId('batch');
+
+    // 早期读数无批次号：同步骤 + 同记录时间归成一批并回填
+    if (!existingBatch) {
+      for (const item of sameTime) {
+        await db.readings.put({ ...item, batchId });
+      }
+    }
+
+    let inserted = 0;
+    let updated = 0;
+    for (const row of rows) {
+      const previous = sameTime.find((item) => item.pointCode === row.pointCode);
+      if (previous) {
+        await db.readings.put({
+          ...previous,
+          displacementMm: row.displacementMm,
+          stressMpa: row.stressMpa,
+          operator,
+          batchId,
+        });
+        updated += 1;
+      } else {
+        await db.readings.put({
+          id: newId('read'),
+          stepId,
+          pointCode: row.pointCode,
+          displacementMm: row.displacementMm,
+          stressMpa: row.stressMpa,
+          recordedAt,
+          operator,
+          batchId,
+          createdAt: stamp,
+          revision: ROW_REVISION,
+        });
+        inserted += 1;
+      }
+    }
+    return { batchId, inserted, updated };
+  });
 }
 
 export async function removeReading(id: string): Promise<void> {

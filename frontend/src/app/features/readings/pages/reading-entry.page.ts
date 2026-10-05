@@ -14,9 +14,11 @@ import { MatSnackBar, MatSnackBarModule } from '@angular/material/snack-bar';
 import { MatTooltipModule } from '@angular/material/tooltip';
 import { STEP_STATE_LABEL, SYNC_REQUIREMENT_LABEL, type StepView } from '../../../core/types/step';
 import {
-  POINT_CODES,
   STRESS_ALERT_MPA,
+  batchLabel,
+  buildStepBatchReports,
   meanDisplacement,
+  readingBatchKey,
   readingDateHint,
   suggestPointCodes,
   syncDeviationMm,
@@ -27,14 +29,16 @@ import { stepActions } from '../../../core/store/step.actions';
 import { buildStepViews, selectStepStats } from '../../../core/store/step.selectors';
 import { selectBridges } from '../../../core/store/bridge.selectors';
 import { IdbTableService } from '../../../core/services/idb-table.service';
-import { putReadings, rowMeta, newId, type ReadingRow } from '../../../core/utils/db';
+import { submitReadingBatch, type ReadingRow } from '../../../core/utils/db';
 import { formatMm, formatStress } from '../../../core/utils/unit';
 import {
+  SYNC_TOLERANCE_MM,
   TOLERANCE_HEX,
   TOLERANCE_LEVEL_LABEL,
   limitAlertText,
   overallLevel,
   syncAlertText,
+  syncLevel,
 } from '../../../core/utils/tolerance';
 import { nowDateTime } from '../../../core/utils/export';
 import { StatBadgeComponent } from '../../../shared/components/common/stat-badge.component';
@@ -102,11 +106,11 @@ interface BatchRow {
         [hint]="selectedStepLabel()"
       />
       <app-stat-badge
-        title="同步偏差"
+        title="最差批次同步偏差"
         [value]="formatMm(currentDeviation())"
         [percent]="deviationShare()"
         [color]="syncColor()"
-        [hint]="'允许值 1.5 mm，当前 ' + syncLevelText()"
+        [hint]="'按批极差取最差批，允许值 1.5 mm · ' + worstBatchText()"
       />
       <app-stat-badge
         title="超限读数"
@@ -228,7 +232,9 @@ interface BatchRow {
               >
                 <div>{{ syncAlertText(batchDeviation(), syncRequirementLabel[step.syncRequirement]) }}</div>
                 <div class="gb-hint">
-                  本批 {{ batchRows().length }} 个测点，平均位移 {{ formatMm(batchAverage()) }}；{{ limitAlertText(batchMax(), step.limitMm) }}
+                  本批 {{ batchRows().length }} 个测点，按本批最大值减最小值计偏差，平均位移
+                  {{ formatMm(batchAverage()) }}；{{ limitAlertText(batchMax(), step.limitMm)
+                  }}；同测点再次提交即更正，以最后提交的读数为准
                 </div>
               </div>
             </div>
@@ -260,9 +266,11 @@ interface BatchRow {
               <tr>
                 <th>步骤</th>
                 <th>桥梁</th>
+                <th>批次</th>
                 <th>测点</th>
                 <th>位移</th>
-                <th>相对偏差</th>
+                <th>批内偏差</th>
+                <th>本批极差</th>
                 <th>应力</th>
                 <th>记录时间</th>
                 <th>记录人</th>
@@ -272,13 +280,30 @@ interface BatchRow {
             </thead>
             <tbody>
               @for (reading of filtered(); track reading.id) {
-                <tr>
+                <tr [class.is-superseded]="reading.superseded">
                   <td>#{{ reading.stepSeq }}</td>
                   <td>{{ reading.bridgeName }}</td>
+                  <td>
+                    {{ reading.batchLabel }}
+                    @if (reading.superseded) {
+                      <mat-chip highlighted class="gb-mini-chip" title="同一测点在该批内有后提交的更正读数，本条不参与偏差计算">
+                        已更正
+                      </mat-chip>
+                    }
+                  </td>
                   <td class="gb-mono">{{ reading.pointCode }}</td>
                   <td>{{ formatMm(reading.displacementMm) }}</td>
                   <td [style.color]="reading.deviationMm === 0 ? '#2e7d32' : '#ed6c02'">
                     {{ formatMm(reading.deviationMm) }}
+                  </td>
+                  <td>
+                    @if (reading.batchDeviationMm !== null) {
+                      <span [style.color]="batchDeviationColor(reading.batchDeviationMm)">
+                        {{ formatMm(reading.batchDeviationMm) }}
+                      </span>
+                    } @else {
+                      <span class="gb-hint">单点批不计</span>
+                    }
                   </td>
                   <td [style.color]="reading.stressAlert ? '#c62828' : '#2e7d32'">
                     {{ formatStress(reading.stressMpa) }}
@@ -313,6 +338,15 @@ interface BatchRow {
         border: 1px solid rgba(22, 34, 46, 0.2);
         border-radius: 6px;
         font-size: 13px;
+      }
+      tr.is-superseded td {
+        opacity: 0.55;
+      }
+      .gb-mini-chip {
+        min-height: 20px !important;
+        font-size: 11px !important;
+        padding: 0 8px !important;
+        margin-left: 4px;
       }
     `,
   ],
@@ -378,29 +412,47 @@ export class ReadingEntryPage {
     { key: 'level', label: '判定', options: ['正常', '关注', '超限'] },
   ]);
 
-  /** 读数视图：带步骤上下文与相对偏差 */
+  /** 读数视图：带步骤上下文、批次信息与批内偏差 */
   readonly readingViews: Signal<ReadingView[]> = computed(() => {
     const steps = new Map(this.stepViews().map((step) => [step.id, step]));
-    return this.readings()
-      .map((reading) => {
-        const step = steps.get(reading.stepId);
-        const sameRound = this.readings().filter(
-          (item) => item.stepId === reading.stepId && item.recordedAt === reading.recordedAt,
-        );
-        const average = meanDisplacement(sameRound);
-        const limitMm = step?.limitMm ?? 0;
-        return {
-          ...reading,
-          stepSeq: step?.seq ?? 0,
-          bridgeId: step?.bridgeId ?? '',
-          bridgeName: step?.bridgeName ?? '未归属桥梁',
-          syncRequirement: step ? SYNC_REQUIREMENT_LABEL[step.syncRequirement] : '-',
-          deviationMm: Number((reading.displacementMm - average).toFixed(3)),
-          overLimit: limitMm > 0 && Math.abs(reading.displacementMm) >= limitMm,
-          stressAlert: reading.stressMpa >= STRESS_ALERT_MPA,
-        };
-      })
-      .sort((a, b) => (a.stepSeq === b.stepSeq ? b.recordedAt.localeCompare(a.recordedAt) : a.stepSeq - b.stepSeq));
+    const reports = buildStepBatchReports(this.readings());
+    const views: ReadingView[] = [];
+    for (const report of reports.values()) {
+      for (const batch of report.batches) {
+        // 批内有效测点（同一测点仅最后提交的一条），平均位移按有效读数计
+        const effectiveIds = new Set(batch.rows.map((row) => row.id));
+        const average = meanDisplacement(batch.rows);
+        const label = batchLabel(batch);
+        for (const reading of this.readings().filter((item) => readingBatchKey(item) === batch.batchId)) {
+          const step = steps.get(reading.stepId);
+          const limitMm = step?.limitMm ?? 0;
+          views.push({
+            ...reading,
+            effectiveBatchId: batch.batchId,
+            batchSeq: batch.seq,
+            batchLabel: label,
+            stepSeq: step?.seq ?? 0,
+            bridgeId: step?.bridgeId ?? '',
+            bridgeName: step?.bridgeName ?? '未归属桥梁',
+            syncRequirement: step ? SYNC_REQUIREMENT_LABEL[step.syncRequirement] : '-',
+            deviationMm: effectiveIds.has(reading.id)
+              ? Number((reading.displacementMm - average).toFixed(3))
+              : 0,
+            batchDeviationMm: batch.deviationMm,
+            superseded: !effectiveIds.has(reading.id),
+            overLimit: limitMm > 0 && Math.abs(reading.displacementMm) >= limitMm,
+            stressAlert: reading.stressMpa >= STRESS_ALERT_MPA,
+          });
+        }
+      }
+    }
+    return views.sort((a, b) =>
+      a.stepSeq === b.stepSeq
+        ? a.batchSeq === b.batchSeq
+          ? b.recordedAt.localeCompare(a.recordedAt)
+          : b.batchSeq - a.batchSeq
+        : a.stepSeq - b.stepSeq,
+    );
   });
 
   readonly filtered = computed(() => {
@@ -419,20 +471,22 @@ export class ReadingEntryPage {
     this.stepViews().find((step) => step.id === this.selectedStepId()) ?? null,
   );
 
+  /** 按步骤汇总的批次报告 */
+  private readonly batchReports = computed(() => buildStepBatchReports(this.readings()));
+
   readonly currentAverage = computed(() => {
     const step = this.selectedStep();
     if (!step) return 0;
-    return meanDisplacement(this.readings().filter((item) => item.stepId === step.id));
+    const report = this.batchReports().get(step.id);
+    const effective = report ? report.batches.flatMap((batch) => batch.rows) : [];
+    return meanDisplacement(effective);
   });
 
-  readonly currentDeviation = computed(() => {
-    const step = this.selectedStep();
-    if (!step) return 0;
-    return syncDeviationMm(this.readings().filter((item) => item.stepId === step.id));
-  });
+  /** 当前步骤最差批次的同步偏差（按批极差取最差） */
+  readonly currentDeviation = computed(() => this.batchReports().get(this.selectedStep()?.id ?? '')?.worstDeviationMm ?? 0);
 
   readonly exceedCount = computed(() =>
-    this.readingViews().filter((reading) => reading.overLimit || reading.stressAlert).length,
+    this.readingViews().filter((reading) => !reading.superseded && (reading.overLimit || reading.stressAlert)).length,
   );
 
   readonly batchAverage = computed(() => meanDisplacement(this.batchRows()));
@@ -530,32 +584,43 @@ export class ReadingEntryPage {
   }
 
   batchDeviationLevel(): ToleranceLevel {
-    const deviation = this.batchDeviation();
-    if (deviation >= 1.5) return 'exceed';
-    if (deviation >= 0.8) return 'watch';
-    return 'ok';
+    return syncLevel(this.batchDeviation());
   }
 
   syncColor(): string {
-    return TOLERANCE_HEX[this.currentDeviation() >= 1.5 ? 'exceed' : this.currentDeviation() >= 0.8 ? 'watch' : 'ok'];
+    return TOLERANCE_HEX[syncLevel(this.currentDeviation())];
   }
 
   syncLevelText(): string {
-    const deviation = this.currentDeviation();
-    return TOLERANCE_LEVEL_LABEL[deviation >= 1.5 ? 'exceed' : deviation >= 0.8 ? 'watch' : 'ok'];
+    return TOLERANCE_LEVEL_LABEL[syncLevel(this.currentDeviation())];
+  }
+
+  /** 最差批次说明文案（顶部统计卡提示） */
+  worstBatchText(): string {
+    const report = this.batchReports().get(this.selectedStep()?.id ?? '');
+    const worst = report?.worstBatch;
+    if (!worst) return report && report.batches.length > 0 ? '仅单点批，不评偏差' : '暂无多点批次';
+    return `${batchLabel(worst)}最差 · 当前 ${this.syncLevelText()}`;
+  }
+
+  /** 批次极差配色（读数表“本批极差”列） */
+  batchDeviationColor(deviationMm: number): string {
+    return TOLERANCE_HEX[syncLevel(deviationMm)];
   }
 
   deviationShare(): number {
-    return Math.min(100, Number(((this.currentDeviation() / 1.5) * 100).toFixed(1)));
+    return Math.min(100, Number(((this.currentDeviation() / SYNC_TOLERANCE_MM) * 100).toFixed(1)));
   }
 
   readingLevelText(reading: ReadingView): string {
+    if (reading.superseded) return '已更正';
     const step = this.selectedStep();
     const limitMm = this.stepViews().find((item) => item.id === reading.stepId)?.limitMm ?? step?.limitMm ?? 0;
     return TOLERANCE_LEVEL_LABEL[overallLevel(reading.displacementMm, limitMm, reading.stressMpa)];
   }
 
   readingColor(reading: ReadingView): string {
+    if (reading.superseded) return '#90a4ae';
     const limitMm = this.stepViews().find((item) => item.id === reading.stepId)?.limitMm ?? 0;
     return TOLERANCE_HEX[overallLevel(reading.displacementMm, limitMm, reading.stressMpa)];
   }
@@ -565,22 +630,22 @@ export class ReadingEntryPage {
     const rows = this.batchRows();
     if (!step || rows.length === 0) return;
     const recorded = this.recordedAt().replace('T', ' ');
-    const payload = rows.map((row) => ({
+    const result = await submitReadingBatch({
       stepId: step.id,
-      pointCode: row.pointCode,
-      displacementMm: row.displacementMm,
-      stressMpa: row.stressMpa,
       recordedAt: recorded,
       operator: this.operator(),
-    }));
-    await putReadings(
-      payload.map((row) => ({ ...row, id: newId('read'), ...rowMeta() })),
-    );
+      rows: rows.map((row) => ({
+        pointCode: row.pointCode,
+        displacementMm: row.displacementMm,
+        stressMpa: row.stressMpa,
+      })),
+    });
     this.idb.emitChange();
+    const correction = result.updated > 0 ? `，更正 ${result.updated} 个测点（以本次提交为准）` : '';
     this.snackBar.open(
-      `已录入 ${payload.length} 条读数，同步偏差 ${formatMm(syncDeviationMm(rows))}`,
+      `已提交本批 ${rows.length} 条读数（新增 ${result.inserted} 条${correction}），本批同步偏差 ${formatMm(syncDeviationMm(rows))}`,
       '关闭',
-      { duration: 3000 },
+      { duration: 3200 },
     );
   }
 

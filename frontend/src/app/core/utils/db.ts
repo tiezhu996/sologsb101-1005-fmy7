@@ -314,6 +314,8 @@ async function seedDatabase(): Promise<void> {
       const pointCount = stepSpec.sync === 'single' ? 1 : 4;
       const rounds = stepSpec.state === 'arrived' ? 3 : 2;
       for (let round = 0; round < rounds; round += 1) {
+        // 同一批（班组逐批录入）共用记录时间，批内仅各测点数值有差异
+        const batchTime = dateTimeText(0, 9 + round, 30);
         for (let point = 0; point < pointCount; point += 1) {
           const base = stepSpec.targetLiftMm * ((round + 1) / (rounds + 1));
           const jitter = (random() - 0.5) * 1.4;
@@ -323,7 +325,7 @@ async function seedDatabase(): Promise<void> {
             pointCode: `P${point + 1}`,
             displacementMm: Number((base + jitter).toFixed(2)),
             stressMpa: Number((7 + random() * 6).toFixed(2)),
-            recordedAt: dateTimeText(0, 9 + round, 5 + point * 5),
+            recordedAt: batchTime,
             operator: operators[(stepIndex + round) % operators.length],
             createdAt: stamp,
             revision: ROW_REVISION,

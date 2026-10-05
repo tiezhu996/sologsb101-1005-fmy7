@@ -33,8 +33,14 @@ export interface ReadingView extends Reading {
   bridgeId: string;
   bridgeName: string;
   syncRequirement: string;
-  /** 同步骤内相对平均位移的偏差（mm） */
+  /** 所属批次时间标签 */
+  batchLabel: string;
+  /** 所属批次序号（同步骤内按记录时间排序，从 1 开始） */
+  batchSeq: number;
+  /** 同批内相对平均位移的偏差（mm，按批内有效读数计算） */
   deviationMm: number;
+  /** 是否被本批后续提交的同测点读数取代（更正前的旧值） */
+  superseded: boolean;
   /** 是否超过限位值 */
   overLimit: boolean;
   /** 应力是否超过关注值 */

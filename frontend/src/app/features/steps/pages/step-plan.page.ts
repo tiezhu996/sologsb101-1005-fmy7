@@ -40,6 +40,7 @@ import {
 import { selectBridges } from '../../../core/store/bridge.selectors';
 import { formatLift, formatMm, share } from '../../../core/utils/unit';
 import { TOLERANCE_HEX, TOLERANCE_LEVEL_LABEL } from '../../../core/utils/tolerance';
+import { arrivalBlockText } from '../../../core/utils/reading-batch';
 import { StatBadgeComponent } from '../../../shared/components/common/stat-badge.component';
 import { EmptyPanelComponent } from '../../../shared/components/common/empty-panel.component';
 import { FilterBarComponent, type FilterSelectSpec } from '../../../shared/components/common/filter-bar.component';
@@ -195,7 +196,7 @@ export class StepDialogComponent {
         [value]="stats().readingCount"
         [suffix]="'条'"
         color="#3949ab"
-        hint="同步偏差按步骤内读数极差计算"
+        hint="同步偏差按批极差计算，取最差那批"
       />
     </div>
 
@@ -266,10 +267,13 @@ export class StepDialogComponent {
                   </mat-chip-set>
                 </td>
                 <td>
-                  {{ step.readingCount }} 条
+                  {{ step.readingCount }} 条 / {{ step.batchCount }} 批
                   @if (step.syncDeviationMm !== null) {
-                    <span [style.color]="levelColor(step)">
-                      / 偏差 {{ formatMm(step.syncDeviationMm) }}（{{ levelLabel(step) }}）
+                    <span
+                      [style.color]="levelColor(step)"
+                      [matTooltip]="'最差为第 ' + step.worstBatchSeq + ' 批（' + step.worstBatchLabel + '）：批内最大减最小'"
+                    >
+                      / 最差批偏差 {{ formatMm(step.syncDeviationMm) }}（{{ levelLabel(step) }}）
                     </span>
                   }
                 </td>
@@ -283,7 +287,13 @@ export class StepDialogComponent {
                       <mat-icon>arrow_downward</mat-icon>
                     </button>
                     @for (next of nextStates(step.state); track next) {
-                      <button mat-button color="primary" (click)="advance(step, next)">
+                      <button
+                        mat-button
+                        color="primary"
+                        [disabled]="advanceBlocked(step, next)"
+                        [matTooltip]="advanceBlockReason(step, next) ?? ''"
+                        (click)="advance(step, next)"
+                      >
                         <mat-icon>play_arrow</mat-icon>
                         {{ stepStateLabel[next] }}
                       </button>
@@ -317,14 +327,14 @@ export class StepDialogComponent {
         [value]="okSteps().length"
         [suffix]="'/' + filtered().length"
         color="#2e7d32"
-        hint="同步偏差处于正常档的步骤数"
+        hint="各批次最差同步偏差处于正常档的步骤数"
       />
       <app-stat-badge
         title="超限步骤"
         [value]="exceedSteps().length"
         [suffix]="'级'"
         color="#c62828"
-        hint="累计顶升量超过限位或同步偏差超允许值"
+        hint="累计顶升量超过限位或任一批次同步偏差超 1.5 mm"
       />
       <app-stat-badge
         title="平均单级顶升量"
@@ -526,7 +536,27 @@ export class StepPlanPage {
     this.notify(`步骤 #${step.seq} 已${direction === -1 ? '上移' : '下移'}`);
   }
 
+  /** 推进到已到位的拦截原因：最差批同步偏差超过 1.5 mm 不放行 */
+  advanceBlockReason(step: StepView, next: StepState): string | null {
+    if (next !== 'arrived') return null;
+    return arrivalBlockText(step.seq, {
+      batchCount: step.batchCount,
+      worstDeviationMm: step.syncDeviationMm,
+      worstBatchLabel: step.worstBatchLabel,
+      worstBatchSeq: step.worstBatchSeq,
+    });
+  }
+
+  advanceBlocked(step: StepView, next: StepState): boolean {
+    return this.advanceBlockReason(step, next) !== null;
+  }
+
   advance(step: StepView, next: StepState): void {
+    const reason = this.advanceBlockReason(step, next);
+    if (reason) {
+      this.notify(reason, 5200);
+      return;
+    }
     this.store.dispatch(stepActions.advanceState({ id: step.id, next }));
     this.notify(`步骤 #${step.seq} 已推进为${STEP_STATE_LABEL[next]}`);
   }
@@ -596,7 +626,7 @@ export class StepPlanPage {
     void this.router.navigate([], { relativeTo: this.route, queryParams, replaceUrl: true });
   }
 
-  private notify(message: string): void {
-    this.snackBar.open(message, '关闭', { duration: 2600 });
+  private notify(message: string, duration = 2600): void {
+    this.snackBar.open(message, '关闭', { duration });
   }
 }

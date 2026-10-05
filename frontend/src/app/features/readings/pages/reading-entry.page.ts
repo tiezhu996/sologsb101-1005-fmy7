@@ -36,6 +36,7 @@ import {
   overallLevel,
   syncAlertText,
 } from '../../../core/utils/tolerance';
+import { buildReadingBatches, shortBatchLabel, summarizeStepBatches } from '../../../core/utils/reading-batch';
 import { nowDateTime } from '../../../core/utils/export';
 import { StatBadgeComponent } from '../../../shared/components/common/stat-badge.component';
 import { EmptyPanelComponent } from '../../../shared/components/common/empty-panel.component';
@@ -102,11 +103,11 @@ interface BatchRow {
         [hint]="selectedStepLabel()"
       />
       <app-stat-badge
-        title="同步偏差"
+        title="最差批同步偏差"
         [value]="formatMm(currentDeviation())"
         [percent]="deviationShare()"
         [color]="syncColor()"
-        [hint]="'允许值 1.5 mm，当前 ' + syncLevelText()"
+        [hint]="'逐批极差取最差批，允许值 1.5 mm，当前 ' + syncLevelText()"
       />
       <app-stat-badge
         title="超限读数"
@@ -260,9 +261,10 @@ interface BatchRow {
               <tr>
                 <th>步骤</th>
                 <th>桥梁</th>
+                <th>批次</th>
                 <th>测点</th>
                 <th>位移</th>
-                <th>相对偏差</th>
+                <th>批内偏差</th>
                 <th>应力</th>
                 <th>记录时间</th>
                 <th>记录人</th>
@@ -272,15 +274,20 @@ interface BatchRow {
             </thead>
             <tbody>
               @for (reading of filtered(); track reading.id) {
-                <tr>
+                <tr [class.row-superseded]="reading.superseded">
                   <td>#{{ reading.stepSeq }}</td>
                   <td>{{ reading.bridgeName }}</td>
+                  <td class="gb-mono">第{{ reading.batchSeq }}批 {{ reading.batchLabel }}</td>
                   <td class="gb-mono">{{ reading.pointCode }}</td>
                   <td>{{ formatMm(reading.displacementMm) }}</td>
-                  <td [style.color]="reading.deviationMm === 0 ? '#2e7d32' : '#ed6c02'">
-                    {{ formatMm(reading.deviationMm) }}
+                  <td [style.color]="deviationCellColor(reading)">
+                    @if (reading.superseded) {
+                      <span class="gb-hint">已更正，不计偏差</span>
+                    } @else {
+                      {{ formatMm(reading.deviationMm) }}
+                    }
                   </td>
-                  <td [style.color]="reading.stressAlert ? '#c62828' : '#2e7d32'">
+                  <td [style.color]="reading.stressAlert && !reading.superseded ? '#c62828' : '#2e7d32'">
                     {{ formatStress(reading.stressMpa) }}
                   </td>
                   <td>{{ reading.recordedAt }}</td>
@@ -290,6 +297,9 @@ interface BatchRow {
                       <mat-chip [style.background]="readingColor(reading)" [style.color]="'#fff'">
                         {{ readingLevelText(reading) }}
                       </mat-chip>
+                      @if (reading.superseded) {
+                        <mat-chip class="chip-superseded">已更正</mat-chip>
+                      }
                     </mat-chip-set>
                   </td>
                   <td>
@@ -313,6 +323,13 @@ interface BatchRow {
         border: 1px solid rgba(22, 34, 46, 0.2);
         border-radius: 6px;
         font-size: 13px;
+      }
+      tr.row-superseded td {
+        opacity: 0.55;
+      }
+      .chip-superseded {
+        background: #eceff1 !important;
+        color: #546e7a !important;
       }
     `,
   ],
@@ -378,16 +395,40 @@ export class ReadingEntryPage {
     { key: 'level', label: '判定', options: ['正常', '关注', '超限'] },
   ]);
 
-  /** 读数视图：带步骤上下文与相对偏差 */
+  /** 按步骤分组的批次（批内同测点只取最后提交） */
+  private readonly batchesByStep = computed(() => {
+    const grouped = new Map<string, ReturnType<typeof buildReadingBatches>>();
+    for (const batch of buildReadingBatches(this.readings())) {
+      const list = grouped.get(batch.stepId) ?? [];
+      list.push(batch);
+      grouped.set(batch.stepId, list);
+    }
+    return grouped;
+  });
+
+  /** 读数 id → 所属批次及批内序号 */
+  private readonly readingBatchMap = computed(() => {
+    const map = new Map<string, { batch: ReturnType<typeof buildReadingBatches>[number]; seq: number }>();
+    for (const stepBatches of this.batchesByStep().values()) {
+      stepBatches.forEach((batch, index) => {
+        for (const row of [...batch.effective, ...batch.superseded]) {
+          map.set(row.id, { batch, seq: index + 1 });
+        }
+      });
+    }
+    return map;
+  });
+
+  /** 读数视图：带步骤上下文、所属批次与批内相对偏差 */
   readonly readingViews: Signal<ReadingView[]> = computed(() => {
     const steps = new Map(this.stepViews().map((step) => [step.id, step]));
+    const readingBatch = this.readingBatchMap();
     return this.readings()
       .map((reading) => {
         const step = steps.get(reading.stepId);
-        const sameRound = this.readings().filter(
-          (item) => item.stepId === reading.stepId && item.recordedAt === reading.recordedAt,
-        );
-        const average = meanDisplacement(sameRound);
+        const info = readingBatch.get(reading.id);
+        const batch = info?.batch;
+        const average = batch ? meanDisplacement(batch.effective) : 0;
         const limitMm = step?.limitMm ?? 0;
         return {
           ...reading,
@@ -395,7 +436,10 @@ export class ReadingEntryPage {
           bridgeId: step?.bridgeId ?? '',
           bridgeName: step?.bridgeName ?? '未归属桥梁',
           syncRequirement: step ? SYNC_REQUIREMENT_LABEL[step.syncRequirement] : '-',
+          batchLabel: batch ? shortBatchLabel(batch.recordedAt) : shortBatchLabel(reading.recordedAt),
+          batchSeq: info?.seq ?? 0,
           deviationMm: Number((reading.displacementMm - average).toFixed(3)),
+          superseded: batch?.superseded.some((item) => item.id === reading.id) ?? false,
           overLimit: limitMm > 0 && Math.abs(reading.displacementMm) >= limitMm,
           stressAlert: reading.stressMpa >= STRESS_ALERT_MPA,
         };
@@ -422,17 +466,21 @@ export class ReadingEntryPage {
   readonly currentAverage = computed(() => {
     const step = this.selectedStep();
     if (!step) return 0;
-    return meanDisplacement(this.readings().filter((item) => item.stepId === step.id));
+    const stepBatches = this.batchesByStep().get(step.id) ?? [];
+    const latest = stepBatches[stepBatches.length - 1];
+    return latest ? meanDisplacement(latest.effective) : 0;
   });
 
+  /** 当前步骤最差批次同步偏差（批内极差，单点批不参与） */
   readonly currentDeviation = computed(() => {
     const step = this.selectedStep();
     if (!step) return 0;
-    return syncDeviationMm(this.readings().filter((item) => item.stepId === step.id));
+    return summarizeStepBatches(this.batchesByStep().get(step.id) ?? []).worstDeviationMm ?? 0;
   });
 
+  /** 超限读数（被更正取代的历史值不再计入） */
   readonly exceedCount = computed(() =>
-    this.readingViews().filter((reading) => reading.overLimit || reading.stressAlert).length,
+    this.readingViews().filter((reading) => !reading.superseded && (reading.overLimit || reading.stressAlert)).length,
   );
 
   readonly batchAverage = computed(() => meanDisplacement(this.batchRows()));
@@ -560,11 +608,25 @@ export class ReadingEntryPage {
     return TOLERANCE_HEX[overallLevel(reading.displacementMm, limitMm, reading.stressMpa)];
   }
 
+  /** 批内偏差着色：被更正的旧值由模板直接置灰 */
+  deviationCellColor(reading: ReadingView): string {
+    if (reading.superseded) return '#90a4ae';
+    return reading.deviationMm === 0 ? '#2e7d32' : '#ed6c02';
+  }
+
   async submitBatch(): Promise<void> {
     const step = this.selectedStep();
     const rows = this.batchRows();
     if (!step || rows.length === 0) return;
     const recorded = this.recordedAt().replace('T', ' ');
+    // 同一步骤、同一批次（记录时间）里已有读数的测点，本次提交按更正处理：只认最后提交值
+    const priorPoints = new Set(
+      this.readings()
+        .filter((item) => item.stepId === step.id && item.recordedAt === recorded)
+        .map((item) => item.pointCode),
+    );
+    const correctedCount = new Set(rows.filter((row) => priorPoints.has(row.pointCode)).map((row) => row.pointCode))
+      .size;
     const payload = rows.map((row) => ({
       stepId: step.id,
       pointCode: row.pointCode,
@@ -577,8 +639,12 @@ export class ReadingEntryPage {
       payload.map((row) => ({ ...row, id: newId('read'), ...rowMeta() })),
     );
     this.idb.emitChange();
+    const suffix =
+      correctedCount > 0
+        ? `（含 ${correctedCount} 个测点更正，已按最后提交值重算）`
+        : '（按本批极差计算）';
     this.snackBar.open(
-      `已录入 ${payload.length} 条读数，同步偏差 ${formatMm(syncDeviationMm(rows))}`,
+      `已录入 ${payload.length} 条读数，本批同步偏差 ${formatMm(syncDeviationMm(rows))}${suffix}`,
       '关闭',
       { duration: 3000 },
     );

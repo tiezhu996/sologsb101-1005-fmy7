@@ -9,8 +9,10 @@ import { IdbTableService } from './idb-table.service';
 import { listBearings, listBridges, listReadings, listSteps } from '../utils/db';
 import type { BridgeRow, BearingRow, ReadingRow, StepRow } from '../utils/db';
 import { sortSteps, SYNC_REQUIREMENT_LABEL, type StepView } from '../types/step';
-import { meanDisplacement, syncDeviationMm, type ReadingView } from '../types/reading';
+import { meanDisplacement, type ReadingView } from '../types/reading';
 import { overallLevel, syncLevel, type ToleranceLevel } from '../utils/tolerance';
+import { buildReadingBatches, shortBatchLabel, summarizeStepBatches } from '../utils/reading-batch';
+import { buildStepViews } from '../store/step.selectors';
 
 /** 步骤时间线的一级节点 */
 export interface StepTimelineNode {
@@ -64,22 +66,41 @@ export class StepTimelineService {
   ]).pipe(
     map(([steps, snapshot]) => {
       const bridges = new Map(snapshot.bridges.map((item) => [item.id, item.name]));
+      const allBatches = buildReadingBatches(snapshot.readings);
+      const batchesByStep = new Map<string, ReturnType<typeof buildReadingBatches>>();
+      const readingBatch = new Map<string, { batch: (typeof allBatches)[number]; seq: number }>();
+      for (const batch of allBatches) {
+        const list = batchesByStep.get(batch.stepId) ?? [];
+        list.push(batch);
+        batchesByStep.set(batch.stepId, list);
+      }
+      for (const [stepId, stepBatches] of batchesByStep) {
+        stepBatches.forEach((batch, index) => {
+          for (const row of [...batch.effective, ...batch.superseded]) {
+            readingBatch.set(row.id, { batch, seq: index + 1 });
+          }
+        });
+      }
       return steps.map((step) => {
+        const stepBatches = batchesByStep.get(step.id) ?? [];
+        const summary = summarizeStepBatches(stepBatches);
         const stepReadings = snapshot.readings
           .filter((item) => item.stepId === step.id)
           .sort((a, b) => a.recordedAt.localeCompare(b.recordedAt))
           .map<ReadingView>((reading) => {
-            const sameRound = snapshot.readings.filter(
-              (item) => item.stepId === reading.stepId && item.recordedAt === reading.recordedAt,
-            );
-            const average = meanDisplacement(sameRound);
+            const info = readingBatch.get(reading.id);
+            const batch = info?.batch;
+            const average = batch ? meanDisplacement(batch.effective) : 0;
             return {
               ...reading,
               stepSeq: step.seq,
               bridgeId: step.bridgeId,
               bridgeName: bridges.get(step.bridgeId) ?? '未归属桥梁',
               syncRequirement: SYNC_REQUIREMENT_LABEL[step.syncRequirement],
+              batchLabel: batch ? shortBatchLabel(batch.recordedAt) : shortBatchLabel(reading.recordedAt),
+              batchSeq: info?.seq ?? 0,
               deviationMm: Number((reading.displacementMm - average).toFixed(3)),
+              superseded: batch?.superseded.some((item) => item.id === reading.id) ?? false,
               overLimit: Math.abs(reading.displacementMm) >= step.limitMm,
               stressAlert: reading.stressMpa >= 12,
             };
@@ -87,7 +108,7 @@ export class StepTimelineService {
         return {
           step,
           readings: stepReadings,
-          deviationLevel: syncLevel(step.syncDeviationMm ?? 0),
+          deviationLevel: syncLevel(summary.worstDeviationMm ?? 0),
           limitLevel: stepReadings.reduce<ToleranceLevel>((worst, reading) => {
             const level = overallLevel(reading.displacementMm, step.limitMm, reading.stressMpa);
             if (level === 'exceed' || worst === 'exceed') return 'exceed';
@@ -126,47 +147,26 @@ export class StepTimelineService {
     shareReplay({ bufferSize: 1, refCount: true }),
   );
 
-  /** 同步偏差流：步骤 id → 偏差 */
+  /** 同步偏差流：步骤 id → 最差批次偏差（单点批不参与） */
   readonly syncDeviation$: Observable<Record<string, number>> = this.snapshot$.pipe(
     map((snapshot) => {
       const result: Record<string, number> = {};
+      const batchesByStep = new Map<string, ReturnType<typeof buildReadingBatches>>();
+      for (const batch of buildReadingBatches(snapshot.readings)) {
+        const list = batchesByStep.get(batch.stepId) ?? [];
+        list.push(batch);
+        batchesByStep.set(batch.stepId, list);
+      }
       for (const step of snapshot.steps) {
-        const rows = snapshot.readings.filter((item) => item.stepId === step.id);
-        result[step.id] = syncDeviationMm(rows);
+        result[step.id] = summarizeStepBatches(batchesByStep.get(step.id) ?? []).worstDeviationMm ?? 0;
       }
       return result;
     }),
     shareReplay({ bufferSize: 1, refCount: true }),
   );
 
-  /** 构建步骤视图（供派生流与页面共用） */
+  /** 构建步骤视图（供派生流与页面共用，口径与 step.selectors 保持一致） */
   buildStepViews(snapshot: StepTimelineSnapshot): StepView[] {
-    const bridgeName = new Map(snapshot.bridges.map((item) => [item.id, item.name]));
-    const ordered = sortSteps(snapshot.steps);
-    const cumulative = new Map<string, number>();
-    let running = 0;
-    for (const step of ordered) {
-      running += step.targetLiftMm;
-      cumulative.set(step.id, Number(running.toFixed(2)));
-    }
-    return ordered.map((step) => {
-      const rows = snapshot.readings.filter((item) => item.stepId === step.id);
-      const cumulativeLiftMm = cumulative.get(step.id) ?? step.targetLiftMm;
-      const deviation = rows.length > 0 ? syncDeviationMm(rows) : null;
-      const overLimit = cumulativeLiftMm > step.limitMm;
-      return {
-        ...step,
-        bridgeName: bridgeName.get(step.bridgeId) ?? '未归属桥梁',
-        cumulativeLiftMm,
-        overLimit,
-        readingCount: rows.length,
-        syncDeviationMm: deviation,
-        validation: overLimit
-          ? `累计顶升量 ${cumulativeLiftMm} mm 已超过限位 ${step.limitMm} mm，需立即停止并复核`
-          : deviation !== null && syncLevel(deviation) === 'exceed'
-            ? `同步偏差 ${deviation.toFixed(2)} mm 超允许值，需调平后继续`
-            : '顶升参数与监测数据均在控制范围内',
-      };
-    });
+    return buildStepViews(sortSteps(snapshot.steps), snapshot.readings, snapshot.bridges);
   }
 }

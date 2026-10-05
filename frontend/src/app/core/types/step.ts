@@ -63,10 +63,16 @@ export interface StepView extends Step {
   cumulativeLiftMm: number;
   /** 累计顶升量与限位值的关系 */
   overLimit: boolean;
-  /** 该步骤的测点读数条数 */
+  /** 该步骤的测点读数条数（含被更正取代的历史条目） */
   readingCount: number;
-  /** 同步偏差（mm），无读数为 null */
+  /** 批次数（同步骤 + 同记录时间归为一批） */
+  batchCount: number;
+  /** 最差批次同步偏差（mm，批内极差），无多点批次为 null */
   syncDeviationMm: number | null;
+  /** 最差批次时间标签 */
+  worstBatchLabel: string | null;
+  /** 最差批次序号（按记录时间排序，从 1 开始） */
+  worstBatchSeq: number | null;
   /** 校验结论文案 */
   validation: string;
 }
